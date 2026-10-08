@@ -35,7 +35,7 @@ pub fn write_report(
         .flat_map(|f| f.down.tls.record_lengths.iter().copied())
         .collect();
     let summary = json!({
-        "schema_version":1,"generator":"capture-rs 2.0.0",
+        "schema_version":1,"generator":concat!("capture-rs ",env!("CARGO_PKG_VERSION")),
         "session":session,
         "summary":{"packets_scanned":analysis.packets_scanned,"packets_matched":analysis.packets_matched,"connections":analysis.flows.len(),
             "attribution":analysis.attribution,"truncated_packets":analysis.truncated_packets,"fragmented_packets":analysis.fragmented_packets,

@@ -45,6 +45,15 @@ system_info() {
     YJ_MEM_KIB="$mem_kib"
 }
 runtime_packages() {
+    local ready=true program
+    for program in python3 tar gzip sha256sum Xvfb xauth; do
+        if ! command -v "$program" >/dev/null 2>&1; then ready=false; fi
+    done
+    if ! chrome_available; then ready=false; fi
+    if [[ "$ready" == true ]] && python3 -c 'import ssl; assert ssl.create_default_context().cert_store_stats()["x509_ca"] > 0' 2>/dev/null; then
+        printf '✓ 运行依赖完整，复用现有 Chrome、证书与工具；无需安装编译环境。\n'
+        return
+    fi
     local root_cmd=()
     if (( EUID != 0 )); then command -v sudo >/dev/null 2>&1 || die "安装系统依赖需要 root 或 sudo"; root_cmd=(sudo); fi
     local family=" ${ID:-} ${ID_LIKE:-} "
@@ -153,7 +162,9 @@ try:
                 p = pathlib.PurePosixPath(member.name)
                 if p.is_absolute() or '..' in p.parts or not (member.isfile() or member.isdir()): raise RuntimeError('不安全的压缩包成员')
                 if member.mode & 0o7000: raise RuntimeError('压缩包含特殊权限')
-            archive.extractall(extracted, members=members)
+            # Python 3.12+ safe extraction; older Python uses the checks above.
+            extraction_options = {'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}
+            archive.extractall(extracted, members=members, **extraction_options)
         package = extracted/'yjpdding'
         executable = package/'bin'/'capture-rs'
         if not executable.is_file(): raise RuntimeError('发行包缺少内核')
