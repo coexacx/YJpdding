@@ -34,7 +34,7 @@ pub fn menu() -> Result<Option<Action>> {
     let choice = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("选择操作")
         .items([
-            "◉  开始采集       使用本机 Chrome 浏览目标",
+            "◉  开始采集       多轮 Chrome 采样与 padding 实测筛选",
             "↻  离线分析       重分析 pcap / pcapng",
             "✓  环境检查       系统、资源、权限与浏览器",
             "↓  一键安装       安装运行依赖与预编译内核",
@@ -119,7 +119,7 @@ fn wizard() -> Result<CaptureArgs> {
         .validate_with(|s: &String| target_url(s).map(|_| ()).map_err(|e| e.to_string()))
         .interact_text()?;
     let duration: u64 = Input::with_theme(&theme)
-        .with_prompt("采集时长（秒，2–3600）")
+        .with_prompt("浏览器采集总时长（秒，至少每轮 2 秒）")
         .default(60)
         .validate_with(|v: &u64| {
             if (2..=3600).contains(v) {
@@ -129,6 +129,20 @@ fn wizard() -> Result<CaptureArgs> {
             }
         })
         .interact_text()?;
+    let rounds = if Select::with_theme(&theme)
+        .with_prompt("采样策略")
+        .items([
+            "三轮优化 · 两轮训练 + 一轮独立复核 + 本机抓包比对",
+            "单轮快速采集 · 不进行多轮筛选",
+        ])
+        .default(0)
+        .interact()?
+        == 0
+    {
+        3
+    } else {
+        1
+    };
     let browser = if Select::with_theme(&theme)
         .with_prompt("Chrome 运行方式")
         .items([
@@ -182,9 +196,11 @@ fn wizard() -> Result<CaptureArgs> {
     } else {
         Protocol::Natural
     };
+    println!("采集 {rounds} 轮 · 每轮抓包上限 256 MiB · 比对抓包另限 64 MiB");
     let mut args = CaptureArgs {
         target,
         duration,
+        rounds,
         interface: "any".into(),
         browser,
         ua,

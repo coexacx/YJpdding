@@ -67,8 +67,12 @@ pub enum Protocol {
 pub struct CaptureArgs {
     /// 域名或 http(s) URL（支持 IPv6 和非标准端口）
     pub target: String,
+    /// 浏览器采集总时长（均分到各轮）；本机候选比对另有 90 秒上限
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(2..=3600))]
     pub duration: u64,
+    /// 3–5 轮启用分层采样和实测筛选；1 轮保留快速采集
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub rounds: u8,
     /// any 同时覆盖路由变化、IPv4/IPv6 和回环
     #[arg(long, default_value = "any")]
     pub interface: String,
@@ -101,6 +105,7 @@ pub struct CaptureArgs {
     /// 输出父目录；每次自动创建独立子目录
     #[arg(long, default_value = "./capture-results")]
     pub output: PathBuf,
+    /// 每轮暂存抓包上限（MiB）；总上限为轮数 × 此值，另加 64 MiB 比对抓包
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..=2048))]
     pub max_mib: u64,
     /// 可选保存本次浏览器 TLS 密钥，供离线解密分析
@@ -175,6 +180,14 @@ pub fn target_url(input: &str) -> Result<Url> {
 
 pub fn validate_capture(args: &CaptureArgs) -> Result<Url> {
     ensure!((2..=3600).contains(&args.duration), "时长必须为 2–3600 秒");
+    ensure!(
+        args.rounds == 1 || (3..=5).contains(&args.rounds),
+        "轮数须为 1 或 3–5"
+    );
+    ensure!(
+        args.duration >= u64::from(args.rounds) * 2,
+        "总时长须至少为每轮 2 秒"
+    );
     ensure!(
         (1..=2048).contains(&args.max_mib),
         "抓包大小必须为 1–2048 MiB"

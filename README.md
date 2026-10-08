@@ -20,7 +20,7 @@ sudo bash capture.sh
 bash capture.sh --check                         # 系统和资源检查
 bash capture.sh --update                        # 更新运行依赖和内核
 bash capture.sh --install --skip-packages       # 已有依赖，只下载内核
-YJPADDING_VERSION=v2.1.0 bash capture.sh --install --skip-packages
+YJPADDING_VERSION=v2.2.0 bash capture.sh --install --skip-packages
 ```
 
 发行资产按架构提供；若某架构尚未发布，安装器会明确失败，不会运行不兼容的内核。安装分支覆盖 Debian/Ubuntu、Fedora/RHEL 系、Arch、openSUSE、Alpine；实际验证的平台和架构见 `docs/validation.md`，不将未验证平台标记为已通过。
@@ -30,13 +30,13 @@ YJPADDING_VERSION=v2.1.0 bash capture.sh --install --skip-packages
 无参数启动为交互菜单。浏览器运行方式与 UA 策略是两个独立选项。
 
 ```bash
-sudo bash capture.sh capture https://example.com --duration 60
-sudo bash capture.sh capture https://corporate.comcast.com/ --ua desktop --duration 30
+sudo bash capture.sh capture https://example.com --duration 20 --rounds 1  # 简单站点快速采集
+sudo bash capture.sh capture https://corporate.comcast.com/ --ua desktop --duration 60 --rounds 3
 sudo bash capture.sh capture https://example.com --browser headed --ua random
 sudo bash capture.sh capture https://example.com --ua native  # 保留无头原始标识作对照
-sudo bash capture.sh capture 'https://[::1]:8443/' --insecure --duration 15
+sudo bash capture.sh capture 'https://[::1]:8443/' --insecure --duration 15 --rounds 1
 sudo bash capture.sh capture https://example.com --ua custom --user-agent 'MyBrowser/1.0'
-sudo bash capture.sh capture https://example.com --protocol natural --cache
+sudo bash capture.sh capture https://example.com --protocol natural --cache --rounds 1
 sudo bash capture.sh capture https://example.com --keylog --reload-interval 0
 sudo bash capture.sh capture https://example.com --browse-interval 0  # 关闭随机站内点击
 bash capture.sh verify-padding padding-candidate.txt              # 本机临时节点验证
@@ -56,9 +56,25 @@ bash capture.sh capture --help
 - 默认成功加载后每 5 秒尝试一次站内随机浏览，最多 30 个不同链接。使用真实鼠标事件，自动滚动到链接，并将站内新标签页链接留在当前采集标签页；只选择同源的普通内容链接，排除表单、下载和明显的状态修改地址。允许目标首次重定向到实际站点。识别到 OneTrust 隐私弹窗时仅使用关闭/拒绝控件。使用 `--browse-interval 0` 关闭此功能。
 - root 启动时，Chrome 默认降权到 nobody 并保留沙箱；特殊受限环境才显式使用 `--no-sandbox`。抓包需要 root 或适当的网络采集 capability。
 
+## 多轮采样和实际抓包筛选（v2.2.0）
+
+默认 `--rounds 3 --duration 60`：浏览器采集总时长 60 秒，分为三个独立 Chrome 会话，每轮约 20 秒；前两轮训练，最后一轮留作独立复核。可使用 3–5 轮，或 `--rounds 1` 保留单轮快速采集。启动/分析耗时与本机比对另计。`--max-mib` 是每轮暂存抓包上限，默认 256 MiB，三轮最多 768 MiB；另有最多 64 MiB 的本机比对暂存抓包。每轮至少 2 秒；复杂站点建议增加采集时长。
+
+- 每轮至少需要 6 条完整、无丢包且关联 Chrome 的 TLS 1.3 连接。简单站点连接不足时明确失败并保留原始抓包，不虚构 padding。
+- 每轮最多均匀保留 128 条连接；按上行/下行、前 8 个加密 record 的位置、后续阶段分别统计。生成规则时每轮权重相同，每个位置每条连接只贡献一个样本，大下载不会凭记录数量压倒其他连接。
+- 只用训练轮生成按位置变化的 P25–P75、P10–P90 两组候选，认证/控制规则保留默认值；后续位置缺少支持时停止生成该位置。浏览器 record 序号仅作为参考位置，不能由此恢复应用或 AnyTLS 的真实 Write 边界。
+- 按每条连接的平均上行记录长度分层，每轮选 6 条代表序列（小、中、大各两个），用于**长度驱动的本机合成负载**。负载长度用 record body 减 17 估计，限制到 1–16384 字节；不重放网站正文，不将该估计标注为解密后的真实长度。
+- 默认配置与最多两组候选各重复两次；反转候选测试顺序，每次使用独立会话，先完成配置同步再测试。Rust/libpcap 实际采集回环流量、独立重组 TLS，逐项核对节点中继标记的记录序列；缺包、标签不一致或清理失败都不允许推荐。
+- 以长度 CDF 差异（KS）、对数分位数差异、发送位置长度误差和记录数量差异评分，越低越接近参考。训练集只选一个胜者；独立复核及两次复核重复均需改善至少 5% 且绝对下降 0.01，上行测试窗口 TLS 字节不能超过默认的 110%，P95 写入往返耗时不能超过默认三倍或 50ms 中的较大者。否则推荐经过互通验证的默认基线。
+- 上行 TLS/负载比包含测试窗口内真实 TLS 头、加密开销、AnyTLS 帧与填充；不包含初始化认证/握手、TCP/IP 和 ACK。下行保留分层统计，当前客户端 padding 规则不控制服务端下载包长。
+
+这是**本机样本长度负载的实际 TLS 记录对比**，不等于 Chrome 通过公网生产节点后完整流量特征已得到验证。候选比对最多 90 秒，状态目录中的独占锁防止并行启动多组比对任务；节点只监听回环地址、低优先级并受 CPU/内存目标限制，正常结束、失败和中断自动清理。不会更改 SSH、网站、路由、代理或网卡卸载设置。
+
+多轮任务顶层包含 `report.txt`、`report.json`、`selection.json`、`sampling.json`、`strata.json`、`calibration-input.json`、`calibration-runtime.json`、`calibration-capture.json`、`目标站点-anytls-comparison.pcap` 及最终 `padding-verified.txt`。各轮原始抓包和浏览器证据位于 `round-01/目标站点-…/` 等目录。独立复核失败不尝试用同一复核集改选第二名，避免把复核数据反过来用于调参。
+
 ## 产物和成功条件
 
-每次运行在 `capture-results/目标站点-时间-随机后缀/`（例如 `corporate.comcast.com-时间-随机后缀/`） 创建独立私有目录：
+单轮运行在 `capture-results/目标站点-时间-随机后缀/`（例如 `corporate.comcast.com-时间-随机后缀/`） 创建独立私有目录：
 
 | 文件 | 用途 |
 |---|---|
@@ -101,7 +117,7 @@ IP 总长、TCP payload、UDP payload、TLS record 分开统计。TCP 包长包�
 
 IP 分片会跳过并计入质量问题；混合链路类型的 pcapng 受 libpcap 离线接口限制。GRO/GSO/TSO 可能使本机抓包长度与线上帧长不同，因此不推断 MTU。没有密钥时不会把 TLS 1.3 加密 record 冒充识别出的 Finished、证书或 HTTP 请求。
 
-AnyTLS 规则依据[官方协议](https://github.com/anytls/anytls-go/blob/fd6167acd6d73b9fa3e607659951847fbc9e6c50/docs/protocol.md)：`0` 为认证填充、后续计数为 TLS Write 次数、`c` 是条件停止标记。默认候选保留认证/控制规则，其余区间来自合格上行 TLS 1.3 样本的统计，并展示假设和简化开销估算。至少需要 3 条完整连接、20 个上行加密 record 及通过质量检查；不足时不生成配置。
+AnyTLS 规则依据[官方协议](https://github.com/anytls/anytls-go/blob/fd6167acd6d73b9fa3e607659951847fbc9e6c50/docs/protocol.md)：`0` 为认证填充、后续计数为 TLS Write 次数、`c` 是条件停止标记。单轮快速采集及离线分析的候选保留原有保守算法：认证/控制规则固定，其余区间来自合格上行样本的 P25–P75，并展示假设和简化开销估算；至少需要 3 条完整连接、20 个上行加密 record。多轮模式采用上文的按位置生成和实测筛选。
 
 **网站 TLS record 无法精确还原 AnyTLS Write 边界。自动测试确认本机参考实现能接受候选并正确传输数据，不等于用户生产节点互通、流量相似性或伪装效果已验证。**
 
@@ -117,6 +133,11 @@ bash build-release.sh
 sudo python3 tests/e2e.py target/x86_64-unknown-linux-musl/release/capture-rs
 python3 tests/runtime_validation.py
 python3 tests/installer.py
+sudo python3 tests/tuning.py --binary target/x86_64-unknown-linux-musl/release/capture-rs
+sudo python3 tests/tuning.py --binary target/x86_64-unknown-linux-musl/release/capture-rs --case interrupt
+sudo python3 tests/tuning.py --binary target/x86_64-unknown-linux-musl/release/capture-rs --case insufficient
+sudo python3 tests/tuning.py --binary target/x86_64-unknown-linux-musl/release/capture-rs --case tampered
+python3 tests/calibration_cleanup.py
 ```
 
 Debian 发布构建依赖：`build-essential musl-tools flex bison pkg-config libpcap-dev python3`，以及通过 rustup 安装的 Rust 工具链。构建脚本验证 libpcap 源码 SHA-256，生成静态发行包和 `SHA256SUMS`；发行包包含第三方版权声明。浏览器自动化使用 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/)，不依赖 ChromeDriver。

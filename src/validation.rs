@@ -53,7 +53,7 @@ pub fn configure_cleanup(output: &Path, cancel: &Arc<AtomicBool>) -> Result<()> 
     )
 }
 
-fn run_helper(
+pub(crate) fn run_helper(
     cmd: &mut Command,
     log: &Path,
     limit: Duration,

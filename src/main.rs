@@ -10,6 +10,7 @@ mod report;
 mod retention;
 mod session;
 mod stream;
+mod tuning;
 mod ui;
 mod validation;
 use anyhow::{Context, Result};
@@ -40,7 +41,17 @@ fn output_dir(parent: &Path, label: &str) -> Result<PathBuf> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
     Ok(path)
 }
-fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>, prepare_timer: bool) -> Result<i32> {
+struct CaptureOutcome {
+    code: i32,
+    output: PathBuf,
+    sample: Option<tuning::RoundSample>,
+}
+fn run_single_capture(
+    args: CaptureArgs,
+    cancel: Arc<AtomicBool>,
+    prepare_timer: bool,
+    verify: bool,
+) -> Result<CaptureOutcome> {
     let url = config::validate_capture(&args)?;
     fs::create_dir_all(&args.output)?;
     let removed = retention::cleanup_root(&args.output, retention::now()?)?;
@@ -52,6 +63,7 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>, prepare_timer: bool) 
     let _lease = retention::Lease::create(&output, url.as_str())?;
     let pcap_path = output.join(format!("{site}.pcap"));
     println!("{} {}", style("输出目录").cyan(), output.display());
+    let mut sample = None;
     let operation = (|| -> Result<i32> {
         if prepare_timer {
             validation::configure_cleanup(&output, &cancel)?;
@@ -204,7 +216,10 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>, prepare_timer: bool) 
         }
         let good = issues.is_empty();
         let mut recommendation = padding::recommend(&a, good);
-        validation::verify_recommendation(&mut recommendation, &output, &cancel);
+        sample = Some(tuning::RoundSample::extract(&a, good, &output));
+        if verify {
+            validation::verify_recommendation(&mut recommendation, &output, &cancel);
+        }
         println!("{}", style("[4/4] 写入报告与采样依据 …").cyan());
         report::write_report(&output, &a, Some(&session), &recommendation)?;
         println!(
@@ -245,6 +260,78 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>, prepare_timer: bool) 
             &json!({"status":"failed","error":format!("{e:#}")}),
         );
         eprintln!("诊断目录：{}", output.display());
+    }
+    operation.map(|code| CaptureOutcome {
+        code,
+        output,
+        sample,
+    })
+}
+fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>, prepare_timer: bool) -> Result<i32> {
+    config::validate_capture(&args)?;
+    if args.rounds == 1 {
+        return Ok(run_single_capture(args, cancel, prepare_timer, true)?.code);
+    }
+    let url = config::target_url(&args.target)?;
+    fs::create_dir_all(&args.output)?;
+    retention::cleanup_root(&args.output, retention::now()?)?;
+    let output = output_dir(&args.output, &retention::site_name(&url))?;
+    let _lease = retention::Lease::create(&output, url.as_str())?;
+    println!("多轮优化目录：{}", output.display());
+    let operation = (|| -> Result<i32> {
+        if prepare_timer {
+            validation::configure_cleanup(&output, &cancel)?;
+        }
+        let mut samples = Vec::new();
+        for round in 0..args.rounds {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(130);
+            }
+            let mut current = args.clone();
+            current.rounds = 1;
+            current.duration = args.duration / u64::from(args.rounds)
+                + u64::from(u64::from(round) < args.duration % u64::from(args.rounds));
+            current.output = output.join(format!("round-{:02}", round + 1));
+            println!(
+                "\n采样轮 {}/{} · {} 秒 · {}",
+                round + 1,
+                args.rounds,
+                current.duration,
+                if round + 1 == args.rounds {
+                    "独立复核"
+                } else {
+                    "训练"
+                }
+            );
+            let result = run_single_capture(current, cancel.clone(), false, false)?;
+            if let Some(mut sample) = result.sample {
+                sample.directory = result
+                    .output
+                    .strip_prefix(&output)?
+                    .to_string_lossy()
+                    .into_owned();
+                samples.push(sample);
+            }
+            report::save_json(&output.join("sampling.json"), &samples)?;
+            if result.code != 0 {
+                report::save_json(
+                    &output.join("failure.json"),
+                    &json!({"status":"sampling_failed", "round":round+1,"code":result.code,"directory":result.output}),
+                )?;
+                return Ok(result.code);
+            }
+        }
+        tuning::optimize(&samples, &url, &output, &cancel)
+    })();
+    if let Err(e) = &operation {
+        let _ = report::save_json(
+            &output.join("failure.json"),
+            &json!({"status":"failed","error":format!("{e:#}")}),
+        );
+        eprintln!("多轮优化诊断目录：{}", output.display());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(130);
     }
     operation
 }
@@ -302,6 +389,8 @@ fn run_self_test(parent: &Path, cancel: Arc<AtomicBool>) -> Result<i32> {
         &format!("http://{address}/"),
         "--duration",
         "3",
+        "--rounds",
+        "1",
         "--reload-interval",
         "0",
         "--browse-interval",

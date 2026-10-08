@@ -28,6 +28,11 @@ def main():
     binary = args.binary.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     records, noise_ports, results = [], set(), []
+    noise_fds, noise_lock = [], threading.Lock()
+    def release_noise_ports():
+        with noise_lock:
+            held = noise_fds[:]; noise_fds.clear()
+        for fd in held: os.close(fd)
     with tempfile.TemporaryDirectory(prefix='yjpdding-test-') as temp:
         temp = pathlib.Path(temp)
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
@@ -113,7 +118,13 @@ def main():
             while not stop_noise.is_set():
                 try:
                     connection = http.client.HTTPSConnection('127.0.0.1', server4.server_port, timeout=2, context=ssl._create_unverified_context())
-                    connection.connect(); noise_ports.add((f'127.0.0.1:{connection.sock.getsockname()[1]}',f'127.0.0.1:{server4.server_port}'))
+                    connection.connect()
+                    # Keep a duplicate descriptor through this test case. Even
+                    # after HTTP Connection: close, its TCP tuple stays reserved
+                    # and cannot be reassigned to Chrome inside the same case.
+                    with noise_lock:
+                        noise_fds.append(os.dup(connection.sock.fileno()))
+                        noise_ports.add((f'127.0.0.1:{connection.sock.getsockname()[1]}',f'127.0.0.1:{server4.server_port}'))
                     connection.request('GET', '/noise', headers={'User-Agent': 'Unrelated-Process'})
                     connection.getresponse().read(); connection.close()
                 except (OSError, http.client.HTTPException): pass
@@ -152,7 +163,7 @@ def main():
                 # A released ephemeral port can be reused by Chrome in a later
                 # case. Compare only noise generated during this invocation.
                 noise_ports.clear()
-                command = [str(binary),'capture',url,'--duration','3','--output',str(directory)]
+                command = [str(binary),'capture',url,'--rounds','1','--duration','3','--output',str(directory)]
                 if '--reload-interval' not in extras: command += ['--reload-interval','0']
                 command += extras
                 if name != 'certificate': command += ['--insecure']
@@ -227,9 +238,11 @@ def main():
                 assert not list(run.glob('.staging-*')), (name,'staging file leaked')
                 result={'case':name,'exit':code,'seconds':round(elapsed,2),'passed':True}
                 results.append(result); print(json.dumps(result),flush=True)
+                release_noise_ports()
         finally:
             stop_noise.set()
             server4.shutdown();server6.shutdown()
+            release_noise_ports()
         (args.output/'results.json').write_text(json.dumps(results,indent=2))
         print(f'PASS: {len(results)} Chrome integration cases',flush=True)
 
