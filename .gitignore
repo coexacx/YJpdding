@@ -1,0 +1,12 @@
+/target/
+/runs/
+/test-output/
+/.build/
+/dist/
+/bin/
+__pycache__/
+*.pyc
+*.pcap
+*.pcapng
+*.keys
+capture-results/

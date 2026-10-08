@@ -1,0 +1,25 @@
+[package]
+name = "capture-rs"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Chrome traffic capture and evidence-based TLS analysis"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+console = "0.16"
+dialoguer = "0.12"
+ctrlc = { version = "3", features = ["termination"] }
+libc = "0.2"
+pcap = "2.5"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tungstenite = "0.28"
+url = { version = "2", features = ["serde"] }
+
+[profile.release]
+lto = "thin"
+strip = true
