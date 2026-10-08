@@ -1,4 +1,5 @@
 mod analysis;
+mod browse;
 mod browser;
 mod capture;
 mod config;
@@ -6,9 +7,11 @@ mod packet;
 mod padding;
 mod process;
 mod report;
+mod retention;
 mod session;
 mod stream;
 mod ui;
+mod validation;
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::{Action, AnalyzeArgs, CaptureArgs, Cli};
@@ -37,11 +40,22 @@ fn output_dir(parent: &Path, label: &str) -> Result<PathBuf> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
     Ok(path)
 }
-fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>) -> Result<i32> {
+fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>, prepare_timer: bool) -> Result<i32> {
     let url = config::validate_capture(&args)?;
-    let output = output_dir(&args.output, "capture")?;
+    fs::create_dir_all(&args.output)?;
+    let removed = retention::cleanup_root(&args.output, retention::now()?)?;
+    if removed > 0 {
+        println!("已清理 {removed} 个超过三天的历史抓包目录");
+    }
+    let site = retention::site_name(&url);
+    let output = output_dir(&args.output, &site)?;
+    let _lease = retention::Lease::create(&output, url.as_str())?;
+    let pcap_path = output.join(format!("{site}.pcap"));
     println!("{} {}", style("输出目录").cyan(), output.display());
     let operation = (|| -> Result<i32> {
+        if prepare_timer {
+            validation::configure_cleanup(&output, &cancel)?;
+        }
         println!("{}", style("[1/4] 启动独立 Chrome 会话 …").cyan());
         let mut browser = browser::Browser::launch(&args, &output, cancel.clone())?;
         println!(
@@ -69,6 +83,8 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>) -> Result<i32> {
         let mut last_nav = Instant::now();
         let mut last_progress = Instant::now();
         let mut last_scroll = Instant::now();
+        let mut last_browse = Instant::now();
+        let mut walker = browse::Walker::new(&url);
         while error.is_none()
             && Instant::now() < deadline
             && !cancel.load(Ordering::Relaxed)
@@ -78,8 +94,40 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>) -> Result<i32> {
                 error = Some(e.to_string());
                 break;
             }
-            if args.reload_interval > 0
+            let mut clicked = false;
+            if args.browse_interval > 0
+                && last_browse.elapsed() >= Duration::from_secs(args.browse_interval)
+                && browser.evidence.successful_documents() > 0
+                && browser.can_reload()
+                && Instant::now() + Duration::from_secs(3) < deadline
+            {
+                match walker.step(&mut browser) {
+                    Ok(browse::Step::Navigated) => {
+                        clicked = true;
+                        last_nav = Instant::now();
+                        println!(
+                            "      站内点击 → {}",
+                            browser.evidence.clicks.last().unwrap().target
+                        );
+                    }
+                    Ok(browse::Step::OverlayDismissed) => {
+                        clicked = true;
+                        last_nav = Instant::now();
+                        println!("      已关闭识别到的隐私弹窗，继续站内浏览");
+                    }
+                    Ok(browse::Step::Idle) => {}
+                    Err(e) => {
+                        if browser.evidence.browsing_errors.len() < 100 {
+                            browser.evidence.browsing_errors.push(e.to_string());
+                        }
+                    }
+                }
+                last_browse = Instant::now();
+            }
+            if !clicked
+                && args.reload_interval > 0
                 && last_nav.elapsed() >= Duration::from_secs(args.reload_interval)
+                && browser.can_reload()
             {
                 if let Err(e) = browser.navigate(url.as_str()) {
                     error = Some(e.to_string());
@@ -87,7 +135,10 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>) -> Result<i32> {
                 }
                 last_nav = Instant::now();
             }
-            if last_scroll.elapsed() >= Duration::from_secs(3) {
+            if clicked {
+                last_scroll = Instant::now();
+            }
+            if !clicked && last_scroll.elapsed() >= Duration::from_secs(3) {
                 if let Err(e) = browser.cdp.send(
                     "Runtime.evaluate",
                     json!({"expression":"window.scrollBy(0, Math.max(300, innerHeight * 0.7))"}),
@@ -143,24 +194,17 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>) -> Result<i32> {
             analysis_quality_errors: 0,
         };
         report::save_json(&output.join("session.json"), &session)?;
-        let a = analysis::analyze(
-            staging.path(),
-            &session.connections,
-            &[],
-            Some(&output.join("capture.pcap")),
-        )?;
+        let a = analysis::analyze(staging.path(), &session.connections, &[], Some(&pcap_path))?;
         session.analysis_quality_errors =
             a.truncated_packets + a.fragmented_packets + a.malformed_packets;
         report::save_json(&output.join("session.json"), &session)?;
-        let good = !interrupted
-            && session.runtime_error.is_none()
-            && !session.capture.size_limit_reached
-            && session.capture.kernel_dropped == 0
-            && session.capture.interface_dropped == 0
-            && session.browser.dropped_events == 0
-            && session.analysis_quality_errors == 0
-            && session.browser.successful_documents() > 0;
-        let recommendation = padding::recommend(&a, good);
+        let mut issues = session.quality_issues();
+        if a.packets_matched == 0 || a.up.ip_lengths.is_empty() || a.down.ip_lengths.is_empty() {
+            issues.push("未匹配到浏览器的完整双向流量，请检查网卡及连接日志".into());
+        }
+        let good = issues.is_empty();
+        let mut recommendation = padding::recommend(&a, good);
+        validation::verify_recommendation(&mut recommendation, &output, &cancel);
         println!("{}", style("[4/4] 写入报告与采样依据 …").cyan());
         report::write_report(&output, &a, Some(&session), &recommendation)?;
         println!(
@@ -171,22 +215,24 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>) -> Result<i32> {
             session.browser.requests.len()
         );
         println!("Padding：{}", recommendation.reason);
+        for issue in &issues {
+            eprintln!("诊断：{issue}");
+        }
         println!(
             "报告：{}\n数据：{}",
             output.join("report.txt").display(),
-            output.join("capture.pcap").display()
+            pcap_path.display()
         );
-        if interrupted {
+        if interrupted || cancel.load(Ordering::Relaxed) {
             return Ok(130);
         }
-        if !good
-            || a.packets_matched == 0
-            || a.up.ip_lengths.is_empty()
-            || a.down.ip_lengths.is_empty()
-        {
+        if !good || recommendation.status == "validation_failed" {
+            if recommendation.status == "validation_failed" {
+                issues.push(recommendation.reason.clone());
+            }
             report::save_json(
                 &output.join("failure.json"),
-                &json!({"status":"partial_or_failed","reason":"页面未成功、流量不完整或运行错误；详情见 session.json / report.txt"}),
+                &json!({"status":"partial_or_failed","reason":issues.join("；"),"issues":issues}),
             )?;
             eprintln!("采集未满足完整成功条件，已保留诊断报告。");
             return Ok(2);
@@ -202,7 +248,7 @@ fn run_capture(args: CaptureArgs, cancel: Arc<AtomicBool>) -> Result<i32> {
     }
     operation
 }
-fn run_analyze(args: AnalyzeArgs) -> Result<i32> {
+fn run_analyze(args: AnalyzeArgs, cancel: Arc<AtomicBool>) -> Result<i32> {
     let session = args
         .session
         .as_ref()
@@ -219,24 +265,123 @@ fn run_analyze(args: AnalyzeArgs) -> Result<i32> {
         .unwrap_or(&[]);
     let output = output_dir(&args.output, "analysis")?;
     let a = analysis::analyze(&args.pcap, connections, &servers, None)?;
-    let quality = session.as_ref().is_some_and(|s| {
-        !s.interrupted
-            && s.runtime_error.is_none()
-            && s.capture.kernel_dropped == 0
-            && s.capture.interface_dropped == 0
-            && !s.capture.size_limit_reached
-            && s.analysis_quality_errors == 0
-            && s.browser.dropped_events == 0
-            && s.browser.successful_documents() > 0
-    });
-    let r = padding::recommend(&a, quality);
+    let quality = session
+        .as_ref()
+        .is_some_and(|s| s.quality_issues().is_empty());
+    let mut r = padding::recommend(&a, quality);
+    validation::verify_recommendation(&mut r, &output, &cancel);
     report::write_report(&output, &a, session.as_ref(), &r)?;
     println!("报告已保存：{}", output.join("report.txt").display());
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(130);
+    }
     if a.packets_matched == 0 {
         eprintln!("没有符合条件的有效数据包");
         return Ok(2);
     }
+    if r.status == "validation_failed" {
+        eprintln!("{}", r.reason);
+        return Ok(2);
+    }
     Ok(0)
+}
+
+fn run_self_test(parent: &Path, cancel: Arc<AtomicBool>) -> Result<i32> {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+    let output = output_dir(parent, "self-test")?;
+    let _lease = retention::Lease::create(&output, "loopback-self-test")?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let cli = Cli::try_parse_from([
+        "capture-rs",
+        "capture",
+        &format!("http://{address}/"),
+        "--duration",
+        "3",
+        "--reload-interval",
+        "0",
+        "--browse-interval",
+        "0",
+        "--output",
+        output.to_str().context("输出路径需要 UTF-8")?,
+    ])?;
+    let Some(Action::Capture(args)) = cli.command else {
+        unreachable!()
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let javascript = Arc::new(AtomicBool::new(false));
+    let (done, seen) = (stop.clone(), javascript.clone());
+    let worker = thread::spawn(move || {
+        while !done.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+                    let _ = socket.set_write_timeout(Some(Duration::from_millis(500)));
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while bytes.len() < 8192 && !bytes.ends_with(b"\r\n\r\n") {
+                        match socket.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(length) => bytes.extend_from_slice(&chunk[..length]),
+                        }
+                    }
+                    if !bytes.ends_with(b"\r\n\r\n") {
+                        continue;
+                    }
+                    let request = String::from_utf8_lossy(&bytes);
+                    if request.starts_with("GET /probe ") {
+                        seen.store(true, Ordering::Relaxed);
+                    }
+                    let body = "<html><body>YJpdding preflight<script>fetch('/probe')</script></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    println!("部署前自检：仅使用回环测试端口 {address}");
+    let captured = run_capture(args, cancel.clone(), false);
+    stop.store(true, Ordering::Relaxed);
+    let _ = worker.join();
+    let browser_ok = matches!(&captured, Ok(0)) && javascript.load(Ordering::Relaxed);
+    let scheme =
+        "stop=8\n0=30-30\n1=100-400\n2=64-512\n3=64-512\n4=64-512\n5=64-512\n6=64-512\n7=64-512\n";
+    let padding = if browser_ok {
+        validation::verify_scheme(scheme, &output, &cancel)
+    } else {
+        json!({"status":"skipped","reason":"Chrome 抓包或 JavaScript 执行检查未通过"})
+    };
+    let passed = browser_ok
+        && padding["status"] == "passed"
+        && padding["cleanup_ok"] == true
+        && !cancel.load(Ordering::Relaxed);
+    report::save_json(
+        &output.join("preflight.json"),
+        &json!({"status":if passed {"passed"} else {"failed"},"chrome_capture":browser_ok,"javascript_executed":javascript.load(Ordering::Relaxed),"capture_error":captured.err().map(|e|format!("{e:#}")),"anytls":padding}),
+    )?;
+    println!(
+        "部署前自检{}：{}",
+        if passed { "通过" } else { "失败" },
+        output.join("preflight.json").display()
+    );
+    Ok(if cancel.load(Ordering::Relaxed) {
+        130
+    } else if passed {
+        0
+    } else {
+        2
+    })
 }
 fn run() -> Result<i32> {
     // Restrict artifacts; prevent orphaned Chrome descendants from becoming zombies.
@@ -254,8 +399,8 @@ fn run() -> Result<i32> {
         None => ui::menu()?,
     };
     match action {
-        Some(Action::Capture(args)) => run_capture(args, cancel),
-        Some(Action::Analyze(args)) => run_analyze(args),
+        Some(Action::Capture(args)) => run_capture(args, cancel, true),
+        Some(Action::Analyze(args)) => run_analyze(args, cancel),
         Some(Action::Doctor) => {
             ui::doctor()?;
             Ok(0)
@@ -263,6 +408,34 @@ fn run() -> Result<i32> {
         Some(Action::Validate { file }) => {
             padding::validate_file(&file)?;
             Ok(0)
+        }
+        Some(Action::Cleanup { state_dir }) => {
+            let state = state_dir.map(Ok).unwrap_or_else(retention::state_dir)?;
+            println!(
+                "已清理 {} 个超过三天的抓包目录",
+                retention::cleanup(&state)?
+            );
+            Ok(0)
+        }
+        Some(Action::SelfTest { output }) => run_self_test(&output, cancel),
+        Some(Action::VerifyPadding { file, output }) => {
+            padding::validate_file(&file)?;
+            let output = output_dir(&output, "padding-validation")?;
+            let result = validation::verify_scheme(&fs::read_to_string(file)?, &output, &cancel);
+            println!(
+                "验证报告：{}",
+                output.join("padding-validation.json").display()
+            );
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(130);
+            }
+            Ok(
+                if result["status"] == "passed" && result["cleanup_ok"] == true {
+                    0
+                } else {
+                    2
+                },
+            )
         }
         None => Ok(0),
     }

@@ -111,7 +111,7 @@ install_release() {
     # Python streams downloads, strips authorization on cross-host redirects, and
     # only installs a checksum-verified archive. Token support is optional.
     python3 - "$REPOSITORY" "$asset" "$INSTALL_DIR" <<'PY'
-import hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile, urllib.error, urllib.request
+import hashlib, json, os, pathlib, shutil, signal, subprocess, sys, tarfile, tempfile, urllib.error, urllib.request
 repo, asset_name, destination = sys.argv[1:]
 root = pathlib.Path(destination).resolve()
 token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
@@ -170,11 +170,34 @@ try:
         if not executable.is_file(): raise RuntimeError('发行包缺少内核')
         executable.chmod(0o755)
         subprocess.run([str(executable), '--version'], check=True, timeout=10)
+        helper = package/'tools'/'runtime.py'
+        if not helper.is_file(): raise RuntimeError('发行包缺少部署验证工具')
+        print('正在准备经过固定 SHA-256 校验的官方 AnyTLS 测试内核（无需 Go/Rust）…', flush=True)
+        subprocess.run([sys.executable, str(helper), 'prepare'], check=True, timeout=60)
+        verification = root/'verification'; verification.mkdir(exist_ok=True)
+        diagnostics = pathlib.Path(tempfile.mkdtemp(prefix='preflight-', dir=verification))
+        env = dict(os.environ, CAPTURE_PROJECT_DIR=str(package), YJPADDING_SKIP_TIMER='1')
+        print('切换版本前自动验证 Chrome 抓包和临时 AnyTLS 节点互通…', flush=True)
+        with (diagnostics/'console.log').open('w') as log:
+            child = subprocess.Popen([str(executable), 'self-test', '--output', str(diagnostics)],
+                                     stdout=log, stderr=subprocess.STDOUT, env=env)
+            try:
+                code = child.wait(timeout=90)
+            except BaseException:
+                child.send_signal(signal.SIGTERM)
+                try: child.wait(timeout=15)
+                except subprocess.TimeoutExpired: child.kill(); child.wait()
+                raise
+        if code != 0: raise RuntimeError(f'部署前验证失败，保留旧内核；诊断目录：{diagnostics}')
+        print('✓ Chrome 抓包、JavaScript 与 AnyTLS 互通验证通过：', diagnostics, flush=True)
         releases = root/'releases'; releases.mkdir(exist_ok=True)
         tag = release['tag_name']
         if not tag or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-' for c in tag): raise RuntimeError('无效发行 tag')
         installed = releases/(tag + '-' + actual[:12])
         if not installed.exists(): shutil.move(str(package), installed)
+        state = os.environ.get('YJPADDING_STATE_DIR') or str(pathlib.Path(os.environ.get('XDG_STATE_HOME', str(pathlib.Path.home()/'.local/state')))/'YJpdding')
+        subprocess.run([sys.executable, str(installed/'tools'/'setup-cleanup.py'),
+                        '--binary', str(installed/'bin'/'capture-rs'), '--state-dir', state], check=True, timeout=55)
         tmp_link = root/('.current-' + str(os.getpid()))
         tmp_link.symlink_to(installed, target_is_directory=True)
         tmp_link.replace(root/'current')

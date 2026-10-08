@@ -8,7 +8,10 @@ pub fn banner() {
     let width = 54;
     println!("\n{}", style(format!("  ╭{}╮", "─".repeat(width))).cyan());
     for text in [
-        "YJ PADDING              CHROME × RUST · v2.0",
+        concat!(
+            "YJ PADDING           CHROME × RUST · v",
+            env!("CARGO_PKG_VERSION")
+        ),
         "真实浏览器采集 · 连接重组 · 可追溯分析",
     ] {
         let padding = " ".repeat(width - console::measure_text_width(text) - 4);
@@ -36,6 +39,8 @@ pub fn menu() -> Result<Option<Action>> {
             "✓  环境检查       系统、资源、权限与浏览器",
             "↓  一键安装       安装运行依赖与预编译内核",
             "◇  校验配置       检查 AnyTLS padding 文件",
+            "◆  节点验证       创建本机临时 AnyTLS 节点测试配置",
+            "✓  部署前自检     Chrome 抓包与 AnyTLS 互通检查",
             "退出",
         ])
         .default(0)
@@ -94,6 +99,16 @@ pub fn menu() -> Result<Option<Action>> {
                 .interact_text()?
                 .into(),
         })),
+        5 => Ok(Some(Action::VerifyPadding {
+            file: Input::<String>::new()
+                .with_prompt("padding 配置文件")
+                .interact_text()?
+                .into(),
+            output: "./capture-results".into(),
+        })),
+        6 => Ok(Some(Action::SelfTest {
+            output: "./capture-results".into(),
+        })),
         _ => Ok(None),
     }
 }
@@ -120,6 +135,7 @@ fn wizard() -> Result<CaptureArgs> {
             "无头模式 · 适合服务器",
             "有界面模式 · 无桌面时自动使用 Xvfb",
         ])
+        .default(0)
         .interact()?
         == 0
     {
@@ -130,14 +146,17 @@ fn wizard() -> Result<CaptureArgs> {
     let ua = match Select::with_theme(&theme)
         .with_prompt("User-Agent 策略")
         .items([
+            "本机桌面 UA · 推荐，无头模式也使用普通 Chrome 标识",
             "本机原生 UA · 保留实际浏览器标识",
             "随机 Chrome UA · 实际版本 + 随机桌面平台",
             "自定义 UA",
         ])
+        .default(0)
         .interact()?
     {
-        0 => UaMode::Native,
-        1 => UaMode::Random,
+        0 => UaMode::Desktop,
+        1 => UaMode::Native,
+        2 => UaMode::Random,
         _ => UaMode::Custom,
     };
     let user_agent = if ua == UaMode::Custom {
@@ -155,6 +174,7 @@ fn wizard() -> Result<CaptureArgs> {
             "TCP/TLS 分析 · 禁用 QUIC，适合 AnyTLS 候选分析",
             "自然浏览 · 保留 QUIC / HTTP/3，分别统计",
         ])
+        .default(0)
         .interact()?
         == 0
     {
@@ -171,6 +191,7 @@ fn wizard() -> Result<CaptureArgs> {
         user_agent,
         protocol,
         reload_interval: 10,
+        browse_interval: 5,
         cache: false,
         insecure: false,
         chrome: None,
@@ -189,8 +210,12 @@ fn wizard() -> Result<CaptureArgs> {
             .default("any".into())
             .interact_text()?;
         args.reload_interval = Input::with_theme(&theme)
-            .with_prompt("重新访问间隔（秒，0 表示仅一次）")
+            .with_prompt("重新访问最小间隔（等待页面完成，0 关闭定时重访）")
             .default(10)
+            .interact_text()?;
+        args.browse_interval = Input::with_theme(&theme)
+            .with_prompt("站内随机点击间隔（秒，0 关闭）")
+            .default(5)
             .interact_text()?;
         args.cache = Confirm::with_theme(&theme)
             .with_prompt("保留本次会话缓存？")

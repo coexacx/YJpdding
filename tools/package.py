@@ -26,6 +26,7 @@ with tempfile.TemporaryDirectory(prefix='yjpdding-package-') as tmp:
     for name in ('capture.sh','install.sh','README.md'):
         shutil.copy2(root/name, package/name)
     shutil.copytree(root/'docs',package/'docs')
+    shutil.copytree(root/'tools',package/'tools',ignore=shutil.ignore_patterns('__pycache__','package.py'))
     (package/'capture.sh').chmod(0o755); (package/'install.sh').chmod(0o755)
     licenses = package/'licenses'; licenses.mkdir()
     shutil.copy2(pcap_license, licenses/'libpcap-1.10.5-LICENSE')

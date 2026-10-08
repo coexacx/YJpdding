@@ -36,7 +36,7 @@ pub fn write_report(
         .collect();
     let summary = json!({
         "schema_version":1,"generator":concat!("capture-rs ",env!("CARGO_PKG_VERSION")),
-        "session":session,
+        "session":session,"diagnostics":session.map(Session::quality_issues).unwrap_or_default(),
         "summary":{"packets_scanned":analysis.packets_scanned,"packets_matched":analysis.packets_matched,"connections":analysis.flows.len(),
             "attribution":analysis.attribution,"truncated_packets":analysis.truncated_packets,"fragmented_packets":analysis.fragmented_packets,
             "malformed_packets":analysis.malformed_packets,"oversized_ip_packets":analysis.oversized_ip_packets,
@@ -64,6 +64,16 @@ pub fn write_report(
         )?;
         writeln!(
             text,
+            "UA 策略：{}\n{}",
+            s.settings["ua"], s.browser.native_ua_note
+        )?;
+        if !s.browser.native_user_agent.is_empty()
+            && s.browser.native_user_agent != s.browser.user_agent
+        {
+            writeln!(text, "原生 UA：{}", s.browser.native_user_agent)?;
+        }
+        writeln!(
+            text,
             "网页请求：{}  主页面成功：{}  导航次数：{}  用时：{:.1}s",
             s.browser.requests.len(),
             s.browser.successful_documents(),
@@ -78,8 +88,20 @@ pub fn write_report(
             s.capture.size_limit_reached,
             s.interrupted
         )?;
-        if let Some(e) = &s.runtime_error {
-            writeln!(text, "运行问题：{e}")?;
+        for issue in s.quality_issues() {
+            writeln!(text, "诊断：{issue}")?;
+        }
+        writeln!(text, "站内鼠标点击：{} 次", s.browser.clicks.len())?;
+        writeln!(
+            text,
+            "已关闭的隐私弹窗：{} 次",
+            s.browser.dismissed_overlays.len()
+        )?;
+        for click in &s.browser.clicks {
+            writeln!(text, "  {} → {}", click.from, click.target)?;
+        }
+        for error in &s.browser.browsing_errors {
+            writeln!(text, "站内浏览提示：{error}")?;
         }
     }
     writeln!(
@@ -170,6 +192,21 @@ pub fn write_report(
             recommendation.estimated_added_ratio.unwrap_or(0.0) * 100.0
         )?;
         atomic_write(&directory.join("padding-candidate.txt"), scheme.as_bytes())?;
+        if recommendation.status == "locally_verified_candidate" {
+            atomic_write(&directory.join("padding-verified.txt"), scheme.as_bytes())?;
+        }
+    }
+    if let Some(v) = &recommendation.validation {
+        writeln!(
+            text,
+            "本机节点验证：{} · {}\n连接数：{}  双向校验字节：{}  临时节点已清理：{}\n范围：{}",
+            v["implementation"].as_str().unwrap_or("—"),
+            v["status"].as_str().unwrap_or("failed"),
+            v["streams"],
+            v["bytes_checked"],
+            v["cleanup_ok"],
+            v["scope"].as_str().unwrap_or("本机临时节点")
+        )?;
     }
     for line in &recommendation.assumptions {
         writeln!(text, "• {line}")?;

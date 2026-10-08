@@ -15,6 +15,7 @@ pub struct Recommendation {
     pub estimated_added_ratio: Option<f64>,
     pub assumptions: Vec<String>,
     pub protocol_reference: &'static str,
+    pub validation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -101,14 +102,14 @@ pub fn recommend(a: &Analysis, quality_ok: bool) -> Recommendation {
         }
     }
     let mut r=Recommendation {status:"insufficient_evidence".into(),reason:String::new(),qualified_connections:n,samples:samples.len(),scheme:None,
-        estimated_mean_added_bytes:None,estimated_added_ratio:None,protocol_reference:REFERENCE,
+        estimated_mean_added_bytes:None,estimated_added_ratio:None,protocol_reference:REFERENCE,validation:None,
         assumptions:vec![
             "候选配置是启发式；浏览器 TLS record 与 AnyTLS Write 调用并非一一对应，不能由 pcap 恢复 Write 边界。".into(),
             "仅采用完整重组且观察到 TLS 1.3 ServerHello 的上行连接；record 长度减去 16 字节 AEAD tag 和 1 字节内部类型，假设无额外 TLS padding。".into(),
             "加密 record 可能包含握手消息，未解密时不会将其标注为 HTTP 请求或 Finished。".into(),
             "padding0 固定采用协议默认认证填充 30；padding1 使用默认控制帧区间，二者不从网站包长反推。".into(),
             "开销仅模拟样本作为单次写入、单段填充的平均增量，不包含认证、TLS/TCP 头、额外记录及实际复用影响。".into(),
-            "尚未在目标 AnyTLS 客户端/服务端部署验证；语法校验不代表流量相似性或可用性保证。".into(),
+            "自动互通测试的范围以 validation 字段为准；本机参考实现通过不代表其他实现、生产节点或流量相似性已经验证。".into(),
         ]};
     if !quality_ok || a.truncated_packets > 0 || a.fragmented_packets > 0 || a.malformed_packets > 0
     {

@@ -24,6 +24,7 @@ def main():
     parser.add_argument('--output', type=pathlib.Path, default=pathlib.Path('test-output'))
     parser.add_argument('--cases', default='all')
     args = parser.parse_args()
+    os.environ['YJPADDING_SKIP_TIMER'] = '1'
     binary = args.binary.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     records, noise_ports, results = [], set(), []
@@ -60,16 +61,33 @@ def main():
 
             def do_GET(self):
                 records.append({'path': self.path, 'ua': self.headers.get('User-Agent'),
-                                'platform': self.headers.get('Sec-CH-UA-Platform'), 'port': self.client_address[1]})
+                                'platform': self.headers.get('Sec-CH-UA-Platform'),
+                                'brands': self.headers.get('Sec-CH-UA'), 'port': self.client_address[1]})
                 if self.path == '/redirect':
                     return self.respond(b'', status=302, extra={'Location': f'https://localhost:{server4.server_port}/'})
                 if self.path == '/denied': return self.respond(b'Access denied', status=403)
                 if self.path == '/slow': time.sleep(8); return self.respond(b'Late')
+                if self.path.startswith('/walk-'):
+                    next_page = {'/walk-root': '/walk-one', '/walk-one': '/walk-two'}.get(self.path, '/walk-root')
+                    body = ('<html><body><a target="_blank" style="display:block;padding:30px;margin-top:1200px" href="'+next_page+'">Next page</a>'
+                            '<a href="/logout">Logout</a><a href="/file.pdf" download>Download</a>'
+                            '<a href="https://external.invalid/">External</a><button onclick="fetch(\'/danger\')">Action</button>'
+                            '<script src="/app.js"></script><script>document.addEventListener("click",e=>navigator.sendBeacon("/click-proof",JSON.stringify({trusted:e.isTrusted})))</script>'
+                            '</body></html>').encode()
+                    if self.path == '/walk-root':
+                        overlay = b'<div id="onetrust-consent-sdk" style="position:fixed;inset:0;background:white;z-index:9999"><button class="onetrust-close-btn-handler" style="padding:30px" onclick="this.parentNode.remove()">Close</button></div>'
+                        body = body.replace(b'</body>', overlay+b'</body>')
+                    return self.respond(body, 'text/html')
+                if self.path == '/ua-gate' and 'HeadlessChrome/' in self.headers.get('User-Agent', ''):
+                    return self.respond(b'Unsupported browser UA', status=403)
                 if self.path == '/bulk': return self.respond(b'B' * (3 * 1024 * 1024))
-                if self.path == '/':
+                if self.path == '/slow-script-page':
+                    return self.respond(b'<html><body><script src="/slow-app.js"></script></body></html>', 'text/html')
+                if self.path in ('/', '/ua-gate'):
                     return self.respond(b'<html><body style="height:4000px"><h1>Chrome fixture</h1><script src="/app.js"></script><img src="/image.svg"></body></html>', 'text/html')
-                if self.path == '/app.js':
-                    return self.respond(b'Promise.all(Array.from({length:12}, (_,i)=>fetch("/data?i="+i))).then(()=>fetch("/ua",{method:"POST",body:JSON.stringify({ua:navigator.userAgent,platform:navigator.platform,hints:navigator.userAgentData?.toJSON()})}));', 'application/javascript')
+                if self.path in ('/app.js', '/slow-app.js'):
+                    if self.path == '/slow-app.js': time.sleep(1.5)
+                    return self.respond(b'Promise.all(Array.from({length:12}, (_,i)=>fetch("/data?i="+i))).then(async()=>fetch("/ua",{method:"POST",body:JSON.stringify({ua:navigator.userAgent,platform:navigator.platform,hints:await navigator.userAgentData?.getHighEntropyValues(["architecture","bitness","model","platformVersion","fullVersionList","wow64"])})}));', 'application/javascript')
                 if self.path == '/image.svg': return self.respond(b'<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>', 'image/svg+xml')
                 return self.respond(b'x' * (400 + len(self.path)*17))
 
@@ -104,7 +122,9 @@ def main():
 
         target = f'https://127.0.0.1:{server4.server_port}'
         cases = [
-            ('native', target+'/', ['--keylog'], 0),
+            ('native', target+'/', ['--keylog', '--ua', 'native'], 0),
+            ('desktop', target+'/ua-gate', [], 0),
+            ('native_rejected', target+'/ua-gate', ['--ua', 'native'], 2),
             ('random', target+'/', ['--ua', 'random'], 0),
             ('custom', target+'/', ['--ua', 'custom', '--user-agent', 'YJpdding-Test/2.0'], 0),
             ('headed', target+'/', ['--browser', 'headed'], 0),
@@ -114,6 +134,9 @@ def main():
             ('certificate', target+'/', [], 2),
             ('http403', target+'/denied', [], 2),
             ('deadline', target+'/slow', [], 2),
+            ('reload_wait', target+'/slow', ['--reload-interval', '1'], 2),
+            ('slow_script', target+'/slow-script-page', ['--reload-interval', '1'], 0),
+            ('browse', target+'/walk-root', ['--browse-interval', '1'], 0),
             ('dns_failure', 'https://this-host-does-not-exist.invalid/', [], 2),
             ('size_limit', target+'/bulk', ['--max-mib','1'], 2),
             ('interrupt', target+'/', [], 130),
@@ -126,9 +149,15 @@ def main():
                 directory = args.output/name
                 directory.mkdir(exist_ok=True)
                 before = set(directory.iterdir()); initial = len(records)
-                command = [str(binary),'capture',url,'--duration','3','--reload-interval','0','--output',str(directory)] + extras
+                # A released ephemeral port can be reused by Chrome in a later
+                # case. Compare only noise generated during this invocation.
+                noise_ports.clear()
+                command = [str(binary),'capture',url,'--duration','3','--output',str(directory)]
+                if '--reload-interval' not in extras: command += ['--reload-interval','0']
+                command += extras
                 if name != 'certificate': command += ['--insecure']
                 if name == 'interrupt': command[command.index('--duration')+1] = '30'
+                if name == 'browse': command[command.index('--duration')+1] = '8'
                 started = time.monotonic()
                 with (directory/'console.log').open('w') as log:
                     proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
@@ -147,20 +176,47 @@ def main():
                         assert session['browser']['requests'], name
                         assert report['summary']['up_ip']['count'] > 0 and report['summary']['down_ip']['count'] > 0
                         selected_ports = {(c['local'],c['remote']) for c in session['connections']}
-                        assert not selected_ports.intersection(noise_ports), (name, 'foreign connection selected')
+                        assert not selected_ports.intersection(noise_ports), (name, 'foreign connection selected', selected_ports.intersection(noise_ports))
                         assert any(r['path'] == '/ua' for r in records[initial:] if 'javascript' in r), (name,'JavaScript not executed')
                     if name == 'native':
                         assert (run/'tls.keys').stat().st_size > 0
-                        assert report['padding']['status'] == 'experimental_candidate', report['padding']
+                        assert report['padding']['status'] == 'locally_verified_candidate', report['padding']
+                        assert report['padding']['validation']['cleanup_ok']
                         subprocess.run([str(binary),'validate',str(run/'padding-candidate.txt')],check=True,capture_output=True)
                         offline = directory/'offline'
-                        subprocess.run([str(binary),'analyze',str(run/'capture.pcap'),'--session',str(run/'session.json'),'--output',str(offline)],check=True,capture_output=True)
+                        subprocess.run([str(binary),'analyze',str(next(run.glob('*.pcap'))),'--session',str(run/'session.json'),'--output',str(offline)],check=True,capture_output=True)
                         off = json.loads(next(offline.glob('*/report.json')).read_text())
                         for key in ('up_tcp_payload','down_tcp_payload','up_tls_record','down_tls_record','packets_matched'):
                             assert off['summary'][key] == report['summary'][key], key
                     if name == 'custom':
                         owned = [r for r in records[initial:] if r.get('ua') != 'Unrelated-Process']
                         assert all(r['ua'] == 'YJpdding-Test/2.0' for r in owned), owned
+                    if name == 'desktop':
+                        browser = session['browser']
+                        assert session['settings']['ua'] == 'desktop'
+                        assert 'HeadlessChrome/' in browser['native_user_agent']
+                        assert browser['user_agent'] == browser['native_user_agent'].replace('HeadlessChrome/', 'Chrome/')
+                        actual = next(r['javascript'] for r in records[initial:] if r.get('path') == '/ua' and 'javascript' in r)
+                        assert actual['ua'] == browser['user_agent']
+                        assert actual['hints'] == browser['user_agent_metadata'], (actual, browser['user_agent_metadata'])
+                        request = next(r for r in records[initial:] if r.get('path') == '/ua-gate')
+                        assert request['platform'] == json.dumps(actual['hints']['platform'])
+                        assert request['brands'] and request['ua'] == actual['ua']
+                    if name == 'native_rejected':
+                        failure = json.loads((run/'failure.json').read_text())
+                        assert 'HTTP 403' in failure['reason'] and '--ua desktop' in failure['reason']
+                    if name == 'reload_wait':
+                        assert session['browser']['navigations'] == 1
+                        assert not any(r['error'] == 'net::ERR_ABORTED' for r in session['browser']['requests'])
+                    if name == 'browse':
+                        paths = {r['path'] for r in records[initial:]}
+                        assert {'/walk-one', '/walk-two'} <= paths, paths
+                        assert not {'/logout', '/file.pdf', '/danger'}.intersection(paths), paths
+                        assert len(session['browser']['clicks']) == 2, session['browser']['clicks']
+                        assert len(session['browser']['dismissed_overlays']) == 1
+                        assert any(r.get('path') == '/click-proof' and r.get('javascript', {}).get('trusted') for r in records[initial:])
+                        assert run.name.startswith('127.0.0.1_')
+                        assert next(run.glob('*.pcap')).name == f'127.0.0.1_{server4.server_port}.pcap'
                     if name == 'headed': assert session['browser']['virtual_display'] == (not os.environ.get('DISPLAY'))
                     if name == 'ipv6': assert any('[' in c['remote'] for c in session['connections'])
                     if name == 'redirect': assert any(r.get('status') == 302 for r in session['browser']['requests'])

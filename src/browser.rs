@@ -44,6 +44,8 @@ pub struct BrowserRequest {
 pub struct BrowserEvidence {
     pub browser_version: String,
     pub user_agent: String,
+    #[serde(default)]
+    pub native_user_agent: String,
     pub user_agent_metadata: Value,
     pub main_frame: String,
     pub requests: Vec<BrowserRequest>,
@@ -53,6 +55,12 @@ pub struct BrowserEvidence {
     pub sandbox_disabled: bool,
     pub virtual_display: bool,
     pub native_ua_note: String,
+    #[serde(default)]
+    pub clicks: Vec<crate::browse::Click>,
+    #[serde(default)]
+    pub browsing_errors: Vec<String>,
+    #[serde(default)]
+    pub dismissed_overlays: Vec<String>,
     #[serde(skip)]
     pub(crate) indices: HashMap<String, usize>,
 }
@@ -93,6 +101,7 @@ impl BrowserEvidence {
             }
             "Network.loadingFailed" => {
                 if let Some(&i) = self.indices.get(&id) {
+                    self.requests[i].finished = true;
                     self.requests[i].error = Some(
                         p["errorText"]
                             .as_str()
@@ -122,6 +131,52 @@ impl BrowserEvidence {
                     && r.status.is_some_and(|s| (200..300).contains(&s))
             })
             .count()
+    }
+    pub fn latest_document(&self) -> Option<&BrowserRequest> {
+        self.requests
+            .iter()
+            .rev()
+            .find(|r| r.resource_type == "Document" && r.frame_id == self.main_frame)
+    }
+    pub fn page_failure(&self) -> Option<String> {
+        if self.successful_documents() > 0 {
+            return None;
+        }
+        let documents: Vec<_> = self
+            .requests
+            .iter()
+            .filter(|r| r.resource_type == "Document" && r.frame_id == self.main_frame)
+            .collect();
+        // Chrome may append ERR_ABORTED retries after the useful original error.
+        let request = documents
+            .iter()
+            .rev()
+            .find(|r| r.error.as_deref().is_some_and(|e| e != "net::ERR_ABORTED"))
+            .copied()
+            .or_else(|| documents.last().copied());
+        let reason = if let Some(r) = request {
+            if let Some(e) = &r.error {
+                format!("主页面访问失败：{e}（{}）", r.url)
+            } else if let Some(status) = r.status.filter(|s| !(200..300).contains(s)) {
+                format!("主页面返回 HTTP {status}（{}）", r.url)
+            } else {
+                "采集时限内主页面未完成加载；可增加 --duration".into()
+            }
+        } else {
+            format!(
+                "未取得主页面请求：{}",
+                self.navigation_errors
+                    .last()
+                    .map(String::as_str)
+                    .unwrap_or("Chrome 未开始或未完成导航")
+            )
+        };
+        let hint = if self.user_agent.contains("HeadlessChrome/") {
+            "；当前 UA 含 HeadlessChrome，可使用 --ua desktop 或 --browser headed 重试"
+        } else {
+            ""
+        };
+        Some(format!("{reason}{hint}"))
     }
 }
 fn apply_response(request: &mut BrowserRequest, r: &Value) {
@@ -227,6 +282,8 @@ pub struct Browser {
     display: Option<Process>,
     pub netlog: PathBuf,
     pub keylog: PathBuf,
+    navigation_pending: Option<u64>,
+    page_loading: bool,
 }
 impl Browser {
     pub fn launch(args: &CaptureArgs, output: &Path, cancel: Arc<AtomicBool>) -> Result<Self> {
@@ -414,8 +471,11 @@ impl Browser {
             .nth(1)
             .unwrap_or("0.0.0.0");
         let native = version["userAgent"].as_str().unwrap_or("");
-        let (ua, metadata, platform) =
-            make_ua(args.ua, native, full_version, args.user_agent.as_deref());
+        let (ua, metadata, platform) = if args.ua == UaMode::Desktop {
+            desktop_identity(&mut cdp)?
+        } else {
+            make_ua(args.ua, native, full_version, args.user_agent.as_deref())
+        };
         if args.ua != UaMode::Native {
             cdp.call(
                 "Emulation.setUserAgentOverride",
@@ -427,6 +487,7 @@ impl Browser {
         let evidence = BrowserEvidence {
             browser_version: version["product"].as_str().unwrap_or("").to_owned(),
             user_agent: ua,
+            native_user_agent: native.to_owned(),
             user_agent_metadata: metadata,
             main_frame: tree["frameTree"]["frame"]["id"]
                 .as_str()
@@ -434,10 +495,10 @@ impl Browser {
                 .to_owned(),
             sandbox_disabled: args.no_sandbox,
             virtual_display: display.is_some(),
-            native_ua_note: if args.ua == UaMode::Native {
-                "保留本机 Chrome 原生 UA 和 Client Hints；无头模式可能含 HeadlessChrome".into()
-            } else {
-                "UA 覆盖仅影响 UA/Client Hints，不改变 Chrome 引擎、TLS 栈或操作系统".into()
+            native_ua_note: match args.ua {
+                UaMode::Desktop => "使用本机桌面 UA（HeadlessChrome → Chrome），Client Hints 读取自本机浏览器，不随机更换平台".into(),
+                UaMode::Native => "保留本机 Chrome 原生 UA 和 Client Hints；无头模式可能含 HeadlessChrome".into(),
+                _ => "UA 覆盖仅影响 UA/Client Hints，不改变 Chrome 引擎、TLS 栈或操作系统".into(),
             },
             ..Default::default()
         };
@@ -451,17 +512,26 @@ impl Browser {
             display,
             netlog,
             keylog,
+            navigation_pending: None,
+            page_loading: false,
         })
     }
     pub fn navigate(&mut self, url: &str) -> Result<()> {
         // Async navigation: a hung DNS/TLS request cannot extend the capture deadline.
-        self.cdp
-            .send("Page.navigate", json!({"url":url}), Some(&self.session))?;
+        self.navigation_pending = Some(self.cdp.send(
+            "Page.navigate",
+            json!({"url":url}),
+            Some(&self.session),
+        )?);
+        self.page_loading = true;
         self.evidence.navigations += 1;
         Ok(())
     }
     pub fn poll(&mut self) -> Result<()> {
         if let Some(event) = self.cdp.poll()? {
+            if event["id"].as_u64().is_some() && event["id"].as_u64() == self.navigation_pending {
+                self.navigation_pending = None;
+            }
             if let Some(e) = event["result"]["errorText"].as_str() {
                 self.evidence.navigation_errors.push(e.to_owned());
             }
@@ -471,10 +541,22 @@ impl Browser {
                     .push(event["error"].to_string());
             }
             if event["sessionId"].as_str() == Some(self.session.as_str()) {
+                if event["params"]["frameId"].as_str() == Some(self.evidence.main_frame.as_str()) {
+                    match event["method"].as_str() {
+                        Some("Page.frameStartedLoading") => self.page_loading = true,
+                        Some("Page.frameStoppedLoading") => self.page_loading = false,
+                        _ => {}
+                    }
+                }
                 self.evidence.event(event);
             }
         }
         Ok(())
+    }
+    pub fn can_reload(&self) -> bool {
+        self.navigation_pending.is_none()
+            && !self.page_loading
+            && self.evidence.latest_document().is_some_and(|r| r.finished)
     }
     pub fn close(&mut self) {
         let _ = self.cdp.send("Browser.close", json!({}), None);
@@ -490,6 +572,57 @@ impl Browser {
         }
         Ok(false)
     }
+}
+
+fn desktop_identity(cdp: &mut Cdp) -> Result<(String, Value, String)> {
+    // about:blank is not a secure context and hides navigator.userAgentData.
+    // Read the real values from an isolated, internal Chrome page. No target or
+    // external website is contacted before the packet capture becomes ready.
+    let target = cdp.call(
+        "Target.createTarget",
+        json!({"url":"chrome://version/"}),
+        None,
+    )?;
+    let result = (|| -> Result<_> {
+        let attached = cdp.call(
+            "Target.attachToTarget",
+            json!({"targetId":target["targetId"],"flatten":true}),
+            None,
+        )?;
+        let session = attached["sessionId"].as_str().context("缺少 UA 探测会话")?;
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            let reply = cdp.call("Runtime.evaluate", json!({
+                "expression":"(async()=>({ua:navigator.userAgent,platform:navigator.platform,hints:await navigator.userAgentData?.getHighEntropyValues(['architecture','bitness','model','platformVersion','fullVersionList','wow64'])}))()",
+                "awaitPromise":true,"returnByValue":true
+            }), Some(session))?;
+            let v = &reply["result"]["value"];
+            if v["hints"].is_object()
+                && v["ua"].as_str().is_some()
+                && v["platform"].as_str().is_some()
+            {
+                return Ok((
+                    v["ua"]
+                        .as_str()
+                        .unwrap()
+                        .replace("HeadlessChrome/", "Chrome/"),
+                    v["hints"].clone(),
+                    v["platform"].as_str().unwrap().to_owned(),
+                ));
+            }
+            ensure!(
+                Instant::now() < end,
+                "无法读取本机 UA Client Hints，可使用 --ua native 或 --ua random"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    })();
+    let _ = cdp.call(
+        "Target.closeTarget",
+        json!({"targetId":target["targetId"]}),
+        None,
+    );
+    result.context("读取本机桌面 UA 失败")
 }
 impl Drop for Browser {
     fn drop(&mut self) {
@@ -555,5 +688,51 @@ mod tests {
         let (ua, meta, _) = make_ua(UaMode::Random, "native", "154.1.2.3", None);
         assert!(ua.contains("Chrome/154.0.0.0"));
         assert_eq!(meta["fullVersionList"][0]["version"], "154.1.2.3");
+    }
+    #[test]
+    fn failure_diagnosis_keeps_protocol_error_before_aborted_retry() {
+        let mut e = BrowserEvidence {
+            main_frame: "main".into(),
+            user_agent: "HeadlessChrome/154.0.0.0".into(),
+            ..Default::default()
+        };
+        for (id, error) in [
+            ("1", "net::ERR_HTTP2_PROTOCOL_ERROR"),
+            ("2", "net::ERR_ABORTED"),
+        ] {
+            e.event(json!({"method":"Network.requestWillBeSent","params":{"requestId":id,"request":{"url":"https://example.com/","method":"GET"},"type":"Document","frameId":"main"}}));
+            e.event(json!({"method":"Network.loadingFailed","params":{"requestId":id,"errorText":error}}));
+        }
+        assert!(e.latest_document().unwrap().finished);
+        assert_eq!(e.successful_documents(), 0);
+        let message = e.page_failure().unwrap();
+        assert!(message.contains("ERR_HTTP2_PROTOCOL_ERROR"));
+        assert!(message.contains("--ua desktop"));
+        e.requests.push(BrowserRequest {
+            resource_type: "Document".into(),
+            frame_id: "main".into(),
+            finished: true,
+            status: Some(200),
+            ..Default::default()
+        });
+        assert!(e.page_failure().is_none());
+    }
+    #[test]
+    fn subframe_success_does_not_hide_main_page_http_denial() {
+        let mut e = BrowserEvidence {
+            main_frame: "main".into(),
+            ..Default::default()
+        };
+        for (frame, status) in [("main", 403), ("child", 200)] {
+            e.requests.push(BrowserRequest {
+                resource_type: "Document".into(),
+                frame_id: frame.into(),
+                finished: true,
+                status: Some(status),
+                ..Default::default()
+            });
+        }
+        assert_eq!(e.successful_documents(), 0);
+        assert!(e.page_failure().unwrap().contains("HTTP 403"));
     }
 }

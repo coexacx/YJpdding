@@ -24,6 +24,22 @@ pub enum Action {
     Doctor,
     /// 检查 AnyTLS padding 文件的语法及边界
     Validate { file: PathBuf },
+    /// 清理登记目录中超过三天且未在运行的抓包任务
+    Cleanup {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// 本机部署前检查：真实 Chrome 抓包及临时 AnyTLS 节点互通
+    SelfTest {
+        #[arg(long, default_value = "./capture-results")]
+        output: PathBuf,
+    },
+    /// 使用本机临时 AnyTLS 客户端和服务端验证候选配置
+    VerifyPadding {
+        file: PathBuf,
+        #[arg(long, default_value = "./capture-results")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
@@ -35,6 +51,7 @@ pub enum BrowserMode {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UaMode {
+    Desktop,
     Native,
     Random,
     Custom,
@@ -57,7 +74,8 @@ pub struct CaptureArgs {
     pub interface: String,
     #[arg(long, value_enum, default_value = "headless")]
     pub browser: BrowserMode,
-    #[arg(long, value_enum, default_value = "native")]
+    /// desktop 使用本机桌面 UA；native 保留 HeadlessChrome 等原始标识
+    #[arg(long, value_enum, default_value = "desktop")]
     pub ua: UaMode,
     /// 仅在 --ua custom 时使用
     #[arg(long)]
@@ -65,9 +83,12 @@ pub struct CaptureArgs {
     /// tcp 禁用 QUIC；natural 保留 Chrome 自然协商
     #[arg(long, value_enum, default_value = "tcp")]
     pub protocol: Protocol,
-    /// 页面重新访问间隔；0 表示只加载一次
+    /// 定时重新访问目标的最小间隔，等待当前页面结束；0 关闭定时重访
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(0..=3600))]
     pub reload_interval: u64,
+    /// 成功加载后随机点击站内页面链接的最小间隔；0 关闭；最多尝试 30 个链接
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(0..=3600))]
+    pub browse_interval: u64,
     /// 保留本次会话的浏览器缓存（默认关闭）
     #[arg(long)]
     pub cache: bool,
@@ -159,6 +180,7 @@ pub fn validate_capture(args: &CaptureArgs) -> Result<Url> {
         "抓包大小必须为 1–2048 MiB"
     );
     ensure!(args.reload_interval <= 3600, "重新访问间隔最大 3600 秒");
+    ensure!(args.browse_interval <= 3600, "站内浏览间隔最大 3600 秒");
     match (args.ua, &args.user_agent) {
         (UaMode::Custom, Some(s))
             if !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control) => {}

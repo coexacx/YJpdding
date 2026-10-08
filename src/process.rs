@@ -36,6 +36,9 @@ impl Process {
         }
         Ok(())
     }
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
     pub fn shutdown(&mut self, graceful: Duration) {
         if self.stopped {
             return;

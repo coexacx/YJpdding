@@ -33,6 +33,43 @@ pub struct Session {
     pub analysis_quality_errors: usize,
 }
 
+impl Session {
+    pub fn quality_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if self.interrupted {
+            issues.push("采集被中断".into());
+        }
+        if let Some(e) = &self.runtime_error {
+            issues.push(format!("运行错误：{e}"));
+        }
+        if self.capture.size_limit_reached {
+            issues.push("达到抓包大小上限；可增加 --max-mib 或缩短采集时间".into());
+        }
+        if self.capture.kernel_dropped > 0 || self.capture.interface_dropped > 0 {
+            issues.push(format!(
+                "抓包丢包：内核 {}，网卡 {}",
+                self.capture.kernel_dropped, self.capture.interface_dropped
+            ));
+        }
+        if self.browser.dropped_events > 0 {
+            issues.push(format!(
+                "浏览器事件超过上限：{}",
+                self.browser.dropped_events
+            ));
+        }
+        if self.analysis_quality_errors > 0 {
+            issues.push(format!(
+                "报文截断、分片或解析问题：{}",
+                self.analysis_quality_errors
+            ));
+        }
+        if let Some(reason) = self.browser.page_failure() {
+            issues.push(reason);
+        }
+        issues
+    }
+}
+
 #[derive(Default)]
 struct SocketEvidence {
     local: Option<SocketAddr>,
